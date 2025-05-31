@@ -32,11 +32,11 @@ if _is_hip and get_bool_env_var("CK_MOE"):
     from aiter import gemm_a8w8_blockscale
 
 _is_cuda = is_cuda()
-if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+# if _is_cuda:
+    # from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+    # from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+    # from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -128,9 +128,9 @@ def apply_w8a8_block_fp8_linear(
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=True
         )
-        output = fp8_blockwise_scaled_mm(
-            q_input, weight.T, x_scale, weight_scale.T, out_dtype=input.dtype
-        )
+        # output = fp8_blockwise_scaled_mm(
+        #     q_input, weight.T, x_scale, weight_scale.T, out_dtype=input.dtype
+        # )
     elif _is_hip and get_bool_env_var("CK_MOE"):
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
@@ -239,12 +239,12 @@ def apply_fp8_linear(
         )
     else:
         # default use per-token quantization if dynamic
-        if _is_cuda:
-            qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
-        else:
-            qinput, x_scale = per_token_group_quant_fp8(
-                input_2d, group_size=input_2d.shape[1]
-            )
+        # if _is_cuda:
+        #     qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+        # else:
+        qinput, x_scale = per_token_group_quant_fp8(
+            input_2d, group_size=input_2d.shape[1]
+        )
 
     if cutlass_fp8_supported:
         try:
@@ -410,19 +410,19 @@ class Fp8LinearOp:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if self.cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-            if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
-            else:
-                qinput, x_scale = ops.scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    scale_ub=input_scale_ub,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
+            # if _is_cuda:
+            #     qinput, x_scale = sgl_scaled_fp8_quant(
+            #         input_2d,
+            #         input_scale,
+            #         use_per_token_if_dynamic=use_per_token_if_dynamic,
+            #     )
+            # else:
+            qinput, x_scale = ops.scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                scale_ub=input_scale_ub,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
 
             # Fused GEMM_DQ
             if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
@@ -453,20 +453,20 @@ class Fp8LinearOp:
         # so fallback to naive if per channel or per token
         else:
             # Maybe apply padding to output, see comment in __init__
-            if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    num_token_padding=self.output_padding,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
-            else:
-                qinput, x_scale = ops.scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    num_token_padding=self.output_padding,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
+            # if _is_cuda:
+            #     qinput, x_scale = sgl_scaled_fp8_quant(
+            #         input_2d,
+            #         input_scale,
+            #         num_token_padding=self.output_padding,
+            #         use_per_token_if_dynamic=use_per_token_if_dynamic,
+            #     )
+            # else:
+            qinput, x_scale = ops.scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=self.output_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
 
             per_tensor_weights = weight_scale.numel() == 1
             per_tensor_activations = x_scale.numel() == 1

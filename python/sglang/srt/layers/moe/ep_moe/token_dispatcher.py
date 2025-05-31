@@ -375,7 +375,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_idx,
             num_max_dispatch_tokens_per_rank,
             num_experts,
-            use_fp8=True,
+            use_fp8=False,
         )
         return (
             hidden_states,

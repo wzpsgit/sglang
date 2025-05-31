@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend, function_profiler
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -140,8 +140,9 @@ class TpModelWorkerClient:
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # Run forward
-            logits_output, next_token_ids = self.worker.forward_batch_generation(
-                model_worker_batch, self.launch_done
+            logits_output, next_token_ids = function_profiler.run(self.worker.tp_rank, 
+                f"batch_forward_{model_worker_batch.forward_mode.name}", 
+                self.worker.forward_batch_generation, model_worker_batch, self.launch_done
             )
 
             # Update the future token ids map

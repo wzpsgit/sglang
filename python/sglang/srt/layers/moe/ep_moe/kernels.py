@@ -1,5 +1,8 @@
 import logging
-from typing import List, Optional
+import os
+import json
+import functools
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -9,11 +12,13 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import is_cuda
 
+from vllm._custom_ops import scaled_int8_quant as vllm_scaled_int8_quant
+
 _is_cuda = is_cuda()
-if _is_cuda:
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
+# if _is_cuda:
+#     from sglang.srt.layers.quantization.fp8_kernel import (
+#         sglang_per_token_group_quant_fp8,
+#     )
 logger = logging.getLogger(__name__)
 
 
@@ -152,7 +157,7 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
 
-    BLOCK_SIZE = 512
+    BLOCK_SIZE = 256
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
@@ -622,6 +627,99 @@ def grouped_gemm_triton_kernel(
     c_mask = (offs_cm[:, None] < m_range_end) & (offs_cn[None, :] < n_range_end)
     tl.store(c_ptr, c_tile, mask=c_mask)
 
+@triton.jit
+def grouped_gemm_triton_kernel_int8(
+    a,
+    b,
+    c,
+    batch_size,
+    M,
+    N,
+    K,
+    seg_indptr,
+    weight_indices,
+    m_num_tiles_indptr,
+    use_int8_w8a8,
+    scale_a,
+    scale_b,
+    a_stride_0: tl.constexpr,
+    a_stride_1: tl.constexpr,
+    b_stride_0: tl.constexpr,
+    b_stride_1: tl.constexpr,
+    b_stride_2: tl.constexpr,
+    a_s_stride_0: tl.constexpr,
+    a_s_stride_1: tl.constexpr,
+    b_s_stride_0: tl.constexpr,
+    b_s_stride_2: tl.constexpr,
+    b_s_stride_1: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    c_dtype = c.dtype.element_ty
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    total_m_block = tl.load(m_num_tiles_indptr + batch_size)
+    if pid_m >= total_m_block:
+        return
+
+    m_range_start, m_range_end, expert_id = compute_m_range(
+        pid_m, batch_size, seg_indptr, weight_indices, m_num_tiles_indptr, BLOCK_SIZE_M
+    )
+    if m_range_end - m_range_start == 0:
+        return
+
+    n_range_start = pid_n * BLOCK_SIZE_N
+    n_range_end = min(n_range_start + BLOCK_SIZE_N, N)
+
+    offs_am = tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = tl.arange(0, BLOCK_SIZE_N)
+
+    offs_am = tl.where(offs_am < m_range_end - m_range_start, offs_am, 0)
+    offs_bn = tl.where(offs_bn < n_range_end - n_range_start, offs_bn, 0)
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptr = a + (m_range_start + offs_am[:, None]) * a_stride_0 + offs_k[None, :]
+    b_ptr = b + (
+        (expert_id * b_stride_0)
+        + (n_range_start + offs_bn[:, None]) * b_stride_1
+        + offs_k[None, :]
+    )
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_tile = tl.load(
+            a_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+        )
+        b_tile = tl.load(
+            b_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+        )
+        accumulator = tl.dot(a_tile, b_tile.T, accumulator)
+        a_ptr += BLOCK_SIZE_K
+        b_ptr += BLOCK_SIZE_K
+
+    accumulator = accumulator.to(tl.float32)
+    if use_int8_w8a8:
+        # Load per-column scale for weights
+        b_scale_ptr = scale_b + expert_id * b_s_stride_0 + (n_range_start + offs_bn[None, :]) * b_s_stride_1
+        b_scale_value = tl.load(b_scale_ptr)
+
+        # Load per-token scale for activations
+        token_mask = (m_range_start + offs_am[:, None]) < M
+        a_scale_ptr = scale_a + (m_range_start + offs_am[:, None]) * a_s_stride_0
+        a_scale_value = tl.load(a_scale_ptr, mask = token_mask, other = 0.0)
+
+        # Dequantization
+        accumulator *= a_scale_value * b_scale_value
+    c_tile = accumulator.to(c_dtype)
+
+    offs_cm = m_range_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_range_start + tl.arange(0, BLOCK_SIZE_N)
+    c_ptr = c + offs_cm[:, None] * N + offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < m_range_end) & (offs_cn[None, :] < n_range_end)
+    tl.store(c_ptr, c_tile, mask=c_mask)
 
 @triton.jit
 def compute_m_num_tiles_indptr(
@@ -633,13 +731,239 @@ def compute_m_num_tiles_indptr(
         pre_num_tiles = tl.load(m_num_tiles_indptr + bs)
         tl.store(m_num_tiles_indptr + bs + 1, pre_num_tiles + cur_num_tiles)
 
+@triton.jit
+def _silu_and_mul_masked_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    # Convert strides to int64 for address calculation
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    # Calculate base offsets
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    # Main processing loop
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        # Load gate and up values
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+
+        # Compute SILU(gate) * up
+        sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+        gate_up = up * (gate * sigmoid)
+
+        # Store BF16 result
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            gate_up.to(tl.bfloat16),
+            mask=offs_in_d < size_n,
+        )
+
+
+@triton.jit
+def opt_m_grouped_gemm_masked_kernel_int8(
+    x_ptr, 
+    y_ptr, 
+    c_ptr,
+    scale_x_ptr,
+    scale_y_ptr,
+    mask_ptr,
+    num_groups, 
+    M, 
+    N, 
+    K,
+    stride_gx, 
+    stride_mx, 
+    stride_kx,
+    stride_gy, 
+    stride_ny, 
+    stride_ky,
+    stride_gc, 
+    stride_mc, 
+    stride_nc,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    use_int8_a8w8: tl.constexpr
+):
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid = tl.program_id(axis=0)
+
+    expert_id = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    mask_pad = tl.load(mask_ptr + expert_id)
+    if (pid_m * BLOCK_SIZE_M >= mask_pad):
+        return
+
+    offs_rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    x_ptrs = x_ptr + expert_id * stride_gx + (offs_rm[:,None] * stride_mx + offs_k[None,:] * stride_kx)
+    y_ptrs = y_ptr + expert_id * stride_gy + (offs_rn[None,:] * stride_ny + offs_k[:,None] * stride_ky)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    if not use_int8_a8w8:
+        accumulator = accumulator.to(tl.float32)
+
+    for k_idx in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        x = tl.load(x_ptrs + k_idx * BLOCK_SIZE_K,
+                    mask=((offs_rm[:,None] < M) & ((offs_k + k_idx * BLOCK_SIZE_K)[None,:] < K)),
+                    other=0.0)
+        y = tl.load(y_ptrs + k_idx * BLOCK_SIZE_K,
+                    mask=((offs_rn[None,:] < N) & ((offs_k + k_idx * BLOCK_SIZE_K)[:,None] < K)),
+                    other=0.0)
+        accumulator += tl.dot(x, y, allow_tf32=True)
+    
+    if use_int8_a8w8:
+        scale_x_ptrs = scale_x_ptr + expert_id * M + offs_rm[:,None]
+        scale_y_ptrs = scale_y_ptr + expert_id * N + offs_rn[None,:]
+        scale_x = tl.load(scale_x_ptrs, mask=(offs_rm[:,None] < M), other=0.0)
+        scale_y = tl.load(scale_y_ptrs, mask=(offs_rn[None,:] < N), other=0.0)
+        accumulator = accumulator.to(tl.float32)
+        accumulator = accumulator * (scale_x * scale_y)
+
+    accumulator = accumulator.to(tl.bfloat16)
+    c_ptrs = c_ptr + expert_id * stride_gc + (offs_rm[:,None] * stride_mc + offs_rn[None,:] * stride_nc)
+    tl.store(c_ptrs, accumulator, mask=(offs_rm[:,None] < M) & (offs_rn[None,:] < N))
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
+    masked_m shape [expert_num], indicates valid tokens per expert
+    """
+    assert input.is_contiguous()
+    assert output.dtype == torch.bfloat16
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    expert_num = len(masked_m)
+
+    # Tuning parameters
+    BLOCK_N = 128  
+    if expert_num < 4:
+        block_num_per_expert = 64
+    else:
+        block_num_per_expert = 32
+
+    num_warps = 4
+    NUM_STAGES = 3
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+
+    grid = (
+        hidden_dim_split_block_num,
+        block_num_per_expert,
+        expert_num,
+    )
+
+    _silu_and_mul_masked_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return
+
+def get_config_dtype_str(dtype: torch.dtype,
+                        use_int8_w8a8: Optional[bool] = False,
+                        use_fp8_w8a8: Optional[bool] = False) -> Optional[str]:
+    if use_int8_w8a8:
+        return "int8_w8a8"
+    elif use_fp8_w8a8:
+        return "fp8_w8a8"
+    elif dtype == torch.float:
+        return "float32"
+    return None
+
+def get_config_file_name(experts_per_ep_rank: int, dtype_str: Optional[str]) -> str:
+    device_name = "Device_4000"
+    dtype_selector = "" if not dtype_str else f",dtype={dtype_str}"
+    return f"E={experts_per_ep_rank},device_name={device_name}{dtype_selector}.json"
+
+@functools.lru_cache
+def get_grouped_gemm_triton_kernel_int8_config(experts_per_ep_rank: int, dtype_str: Optional[str]) -> Optional[Dict[int, Any]]:
+    json_file_name = get_config_file_name(experts_per_ep_rank, dtype_str)
+
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if os.path.exists(config_file_path):
+        with open(config_file_path) as f:
+            # If a configuration has been found, return it
+            return {int(key): val for key, val in json.load(f).items()}
+
+    # If no optimized configuration is available, we will use the default configuration
+    logger.warning(
+        (
+            "Using default MoE config. Performance might be sub-optimal! "
+            "Config file not found at %s"
+        ),
+        config_file_path,
+    )
+    return None
 
 def grouped_gemm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
     c: torch.Tensor,
     batch_size: int,
+    top_k: int,
     weight_column_major: bool,
+    gateup_stage: bool,
     seg_indptr: Optional[torch.Tensor] = None,
     weight_indices: Optional[torch.Tensor] = None,
     use_fp8_w8a8: bool = False,
@@ -651,24 +975,27 @@ def grouped_gemm_triton(
     if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
-    if block_shape is not None:
-        assert len(block_shape) == 2
-        block_n, block_k = block_shape[0], block_shape[1]
-        if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
-        else:
-            a, scale_a = per_token_group_quant_fp8(a, block_k)
+    # if block_shape is not None:
+    #     assert len(block_shape) == 2
+    #     block_n, block_k = block_shape[0], block_shape[1]
+    #     if _is_cuda:
+    #         a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+    #     else:
+    #         a, scale_a = per_token_group_quant_fp8(a, block_k)
 
-        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
-        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
-        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+    #     assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+    #     assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+    #     assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
     config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 4,
+        "pipeline": "cpasync",
     }
 
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
@@ -681,29 +1008,111 @@ def grouped_gemm_triton(
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
 
-    grouped_gemm_triton_kernel[grid](
-        a,
-        b,
-        c,
-        batch_size,
-        b.size(1),
-        b.size(2),
-        seg_indptr,
-        weight_indices,
-        m_num_tiles_indptr,
-        scale_a,
-        scale_b,
-        use_fp8_w8a8,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
-        a.stride(0),
-        b.stride(0),
-        b.stride(1),
-        scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
-        scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
-        scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
-        scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
-        scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
-        **config,
-    )
+    # TODO: Remove kernel after validation: when block_n = 1 and block_k = 1, group quantization will degenerate into per-channel quantization and per-token quantization
+    if (a.dtype is not torch.int8) and (b.dtype == torch.int8):
+        assert b.dim() == 3 and scale_b.dim() == 3, "Unexpected shape of b for grouped_gemm_int8 kernel"
+
+        # Note: batch size is always equal to num_experts_per_ep_rank, and num_experts_per_ep_rank = num_experts // ep_size
+        #       Use default config if no optimized configuration is available
+        # TODO: Enable optimized config after validation
+        # dtype_str = get_config_dtype_str(a.dtype, use_int8_w8a8 = True)
+        # configs = get_grouped_gemm_triton_kernel_int8_config(batch_size, dtype_str)
+        # if (configs is not None) and (gateup_stage is True):
+        #     config = configs[min(configs.keys(), key = lambda x: abs(x - (a.shape[0] / top_k)))]["stage1"]
+        # elif (configs is not None) and (gateup_stage is False):
+        #     config = configs[min(configs.keys(), key = lambda x: abs(x - (a.shape[0] / top_k)))]["stage2"]
+
+        a_quant_val, a_quant_scale, _ = vllm_scaled_int8_quant(a)
+        grouped_gemm_triton_kernel_int8[grid](
+            a = a_quant_val,
+            b = b,
+            c = c,
+            batch_size = batch_size,
+            M = a.size(0),
+            N = b.size(1),
+            K = b.size(2),
+            seg_indptr = seg_indptr,
+            weight_indices = weight_indices,
+            m_num_tiles_indptr = m_num_tiles_indptr,
+            use_int8_w8a8 = True,
+            scale_a = a_quant_scale,
+            scale_b = scale_b,
+            a_stride_0 = a.stride(0),
+            a_stride_1 = a.stride(1),
+            b_stride_0 = b.stride(0),
+            b_stride_1 = b.stride(1),
+            b_stride_2 = b.stride(2),
+            a_s_stride_0 = a_quant_scale.stride(0),
+            a_s_stride_1 = a_quant_scale.stride(1),
+            b_s_stride_0 = scale_b.stride(0),
+            b_s_stride_2 = scale_b.stride(2),
+            b_s_stride_1 = scale_b.stride(1),
+            **config,
+        )
+    else:
+        grouped_gemm_triton_kernel[grid](
+            a,
+            b,
+            c,
+            batch_size,
+            b.size(1),
+            b.size(2),
+            seg_indptr,
+            weight_indices,
+            m_num_tiles_indptr,
+            scale_a,
+            scale_b,
+            use_fp8_w8a8,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            a.stride(0),
+            b.stride(0),
+            b.stride(1),
+            scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
+            scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
+            scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
+            scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
+            scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
+            **config,
+        )
     return c
+
+
+def m_grouped_gemm_nt_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    masked_m: torch.Tensor,
+    excepted_m: int,
+    scale_b: torch.Tensor = None,
+    use_triton_kernel: bool = True
+):
+    assert a.dim() == 3 and b.dim() == 3
+    num_groups, m, k = a.shape
+    _, n, _ = b.shape
+    
+    if use_triton_kernel:
+        a_quant_val, a_quant_scale, _ = vllm_scaled_int8_quant(a)
+        assert a_quant_val.is_contiguous()
+        assert b.is_contiguous()
+        assert a_quant_scale.is_contiguous()
+        assert scale_b.is_contiguous()
+
+        config = {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1, 'pipeline': 'cpasync', 'num_stages':4, 'num_warps':4}
+        grid = lambda META:(num_groups *
+                        triton.cdiv(m, META['BLOCK_SIZE_M']) * 
+                        triton.cdiv(n, META['BLOCK_SIZE_N']), )
+
+
+        opt_m_grouped_gemm_masked_kernel_int8[grid](
+            a_quant_val, b, c, a_quant_scale, scale_b, masked_m,
+            num_groups, m, n, k,
+            a.stride(0), a.stride(1), a.stride(2),
+            b.stride(0), b.stride(1), b.stride(2),
+            c.stride(0), c.stride(1), c.stride(2),
+            use_int8_a8w8=True,
+            **config,
+        )
+        return c
+    else:
+        raise NotImplementedError

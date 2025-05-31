@@ -6,7 +6,8 @@ from sglang.srt.utils import is_cuda_available, set_weight_attrs
 
 is_cuda = is_cuda_available()
 if is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    # from sgl_kernel import int8_scaled_mm
+    from vllm import _custom_ops as ops
 
 from torch.nn.parameter import Parameter
 
@@ -116,9 +117,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
     ):
         x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+        # return int8_scaled_mm(
+        #     x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+        # )
+        return ops.cutlass_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias)
+
 
 
 class W8A8Int8MoEMethod:
@@ -266,3 +269,81 @@ class W8A8Int8MoEMethod:
             a2_scale=layer.w2_input_scale,
             no_combine=no_combine,
         )
+
+class W8A8Int8EPMoEMethod(W8A8Int8MoEMethod):
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # Weights
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition, 2 * intermediate_size, hidden_size, dtype=torch.int8
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(num_experts_per_partition, hidden_size, intermediate_size, dtype=torch.int8),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts_per_partition, 2 * intermediate_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts_per_partition, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # Dynamic update in EPMoE forward fucntion
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Note: Has been done in EPMoE weight loader, do nothing here
+        pass
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+    ) -> torch.Tensor:
+        # Never invoke in EPMoE
+        raise NotImplementedError

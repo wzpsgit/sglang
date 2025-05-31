@@ -321,15 +321,22 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
 
+        # Note: sglang 0.4.5 need full intermediate size pre-sharding for WNA16 act order
+        moe_quant_params = {
+            "num_experts": num_experts,
+            "hidden_size": hidden_size,
+            "intermediate_size": self.intermediate_size_per_partition,
+            "intermediate_size_per_partition": self.intermediate_size_per_partition,
+            "params_dtype": params_dtype,
+            "weight_loader": self.weight_loader,
+        }
+        if (self.quant_method.__class__.__name__
+                in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
+            moe_quant_params["intermediate_size_full"] = intermediate_size
+
         self.quant_method.create_weights(
             layer=self,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            # FIXME: figure out which intermediate_size to use
-            intermediate_size=self.intermediate_size_per_partition,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
+            **moe_quant_params
         )
 
     def _load_per_tensor_weight_scale(

@@ -15,7 +15,8 @@
 Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
-
+import os
+import contextlib
 import torch
 import triton
 import triton.language as tl
@@ -31,6 +32,17 @@ if is_cuda_available:
 
 _is_hip = is_hip()
 
+@contextlib.contextmanager
+def enable_fwd_kernel_opt_env(value: str):
+    original_value = os.environ.get("TRITON_DISABLE_MACA_C_STRORE_PAD")
+    os.environ["TRITON_DISABLE_MACA_C_STRORE_PAD"] = value
+    try:
+        yield
+    finally:
+        if original_value is None:
+            del os.environ["TRITON_DISABLE_MACA_C_STRORE_PAD"]
+        else:
+            os.environ["TRITON_DISABLE_MACA_C_STRORE_PAD"] = original_value
 
 @triton.jit
 def tanh(x):
@@ -341,25 +353,20 @@ def extend_attention_fwd(
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
+            if Lq <= 128:
+                # BLOCK_M, BLOCK_N = (64, 128)
+                BLOCK_M, BLOCK_N = (64, 64)  # consideration for C500 shared memory
+            elif Lq <= 256:
+                # BLOCK_M, BLOCK_N = (64, 64)
+                BLOCK_M, BLOCK_N = (64, 32)  # requested by triton team
             else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
+                # BLOCK_M, BLOCK_N = (32, 32)
+                BLOCK_M, BLOCK_N = (16, 16)  # requested by triton team
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-        num_warps = 4 if Lk <= 64 else 8
+        # num_warps = 4 if Lk <= 64 else 8
+        num_warps = 4  # requested by triton team
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -370,53 +377,111 @@ def extend_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    # Default config, D_V = 512
     num_stages = 1
+    extra_kargs = {"scenario" : "mla"}
 
-    extra_kargs = {}
+    # Double buffer config, D_V = 128
+    if v_extend.dim() == 3 and v_extend.shape[2] == 128 and BLOCK_M == 16 and BLOCK_N == 16:
+        num_stages = 2
+        extra_kargs = {"scenario" : "mla", "pipeline" : "cpasync"}
+
+    # extra_kargs = {"scenario" : "flashattn-fwd"}  # requested by triton team
     if _is_hip:
+        num_stages = 1
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _fwd_kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        sm_scale,
-        kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        logit_cap=logit_cap,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
-    )
+    if is_cuda_available and Lq > 256:
+        # TRITON_DISABLE_MACA_C_STRORE_PAD environment variable is experimental, and only available for fwd_kernel, D_V = 512 + D_QK = 576
+        with enable_fwd_kernel_opt_env("1"):
+            BLOCK_M, BLOCK_N = (64, 16)
+            num_warps = 8
+            num_stages = 2
+            extra_kargs = {"scenario" : "mla;singleshm", "pipeline" : "basic", "pipeline_load_num" : 1}
+            grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+            _fwd_kernel[grid](
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                mask_indptr,
+                sm_scale,
+                kv_group_num,
+                q_extend.stride(0),
+                q_extend.stride(1),
+                k_extend.stride(0),
+                k_extend.stride(1),
+                v_extend.stride(0),
+                v_extend.stride(1),
+                o_extend.stride(0),
+                o_extend.stride(1),
+                k_buffer.stride(0),
+                k_buffer.stride(1),
+                v_buffer.stride(0),
+                v_buffer.stride(1),
+                logit_cap=logit_cap,
+                BLOCK_DMODEL=BLOCK_DMODEL,
+                BLOCK_DPE=BLOCK_DPE,
+                BLOCK_DV=BLOCK_DV,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                Lq=Lq,
+                Lv=Lv,
+                USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+                SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+                STORE_TRANSPOSE=_is_hip,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                **extra_kargs,
+            )
+    else:
+        _fwd_kernel[grid](
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
+            sm_scale,
+            kv_group_num,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            logit_cap=logit_cap,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            Lq=Lq,
+            Lv=Lv,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+            STORE_TRANSPOSE=_is_hip,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **extra_kargs,
+        )
 
 
 def redundant_attention(

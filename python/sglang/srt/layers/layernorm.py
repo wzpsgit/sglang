@@ -35,6 +35,31 @@ from sglang.srt.custom_op import CustomOp
 
 logger = logging.getLogger(__name__)
 
+def vllm_rms_norm(x: torch.Tensor, weight: torch.Tensor,
+             variance_epsilon: float, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    from vllm import _custom_ops as vllm_ops
+    if out is None:
+        out = torch.empty_like(x)
+    vllm_ops.rms_norm(
+        out,
+        x,
+        weight,
+        variance_epsilon,
+    )
+    return out
+
+
+def vllm_fused_add_rms_norm(
+        x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        variance_epsilon: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    from vllm import _custom_ops as vllm_ops
+    vllm_ops.fused_add_rms_norm(
+        x,
+        residual,
+        weight,
+        variance_epsilon,
+    )
+    return x, residual
 
 class RMSNorm(CustomOp):
     def __init__(
@@ -53,10 +78,16 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
         if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+            if x.dtype == torch.float16:
+                return vllm_fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            else:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+
+        if x.dtype == torch.float16:
+            return vllm_rms_norm(x, self.weight.data, self.variance_epsilon)
+        else:
+            return rmsnorm(x, self.weight.data, self.variance_epsilon)
 
     def forward_native(
         self,

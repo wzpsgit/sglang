@@ -323,9 +323,12 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput()
-
+    logger.info(f"Profiling request input = {obj}")
     await _global_state.tokenizer_manager.start_profile(
-        obj.output_dir, obj.num_steps, obj.activities
+        obj.output_dir, obj.num_steps, obj.activities, obj.with_stack, obj.record_shapes,
+        obj.profile_memory, obj.profile_funcs, obj.tp_ranks,
+        obj.profile_steps, obj.skip_first, obj.wait,
+        obj.active, obj.repeat
     )
     return Response(
         content="Start profiling.\n",

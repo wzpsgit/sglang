@@ -81,7 +81,21 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    function_profiler
 )
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def mark_prefill_kernel(X, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    X = X + pid
+
+@triton.jit
+def mark_decode_kernel(X, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    X = X + pid
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +126,7 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_size = server_args.dp_size
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
@@ -158,6 +173,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "enable_flashmla": server_args.enable_flashmla,
+                "enable_flashinfer_grouped_gemm": server_args.enable_flashinfer_grouped_gemm,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
@@ -322,7 +338,8 @@ class ModelRunner:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
-        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        # set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_custom_all_reduce(False)
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
@@ -834,6 +851,9 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
+        os.environ["TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP"] = "1"
+        os.environ["TRITON_ENABLE_MACA_CHAIN_DOT_OPT"] = "1"
+        
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
@@ -996,11 +1016,17 @@ class ModelRunner:
             )
 
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch)
+            logits_output = self.forward_decode(forward_batch) 
+            if self.enable_torch_profile:
+                a = torch.zeros((1,), dtype=torch.float32, device="cuda")
+                mark_decode_kernel[(1,)](a, 128)
+            return logits_output
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(
-                forward_batch, skip_attn_backend_init=skip_attn_backend_init
-            )
+            logits_output = self.forward_extend(forward_batch, skip_attn_backend_init)          
+            if self.enable_torch_profile:
+                a = torch.zeros((1,), dtype=torch.float32, device="cuda")
+                mark_prefill_kernel[(1,)](a, 128)
+            return logits_output
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:

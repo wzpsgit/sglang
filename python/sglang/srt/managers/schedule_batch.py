@@ -77,6 +77,7 @@ global_server_args_dict = {
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "enable_flashmla": ServerArgs.enable_flashmla,
+    "enable_flashinfer_grouped_gemm": ServerArgs.enable_flashinfer_grouped_gemm,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
@@ -674,6 +675,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    global_is_extend_in_batch: bool = False
 
     # For processing logprobs
     return_logprob: bool = False
@@ -753,6 +755,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def is_extend_dp_batch(self):
+        return self.global_is_extend_in_batch
+
+    def is_decode_dp_batch(self):
+        return (
+            not self.global_is_extend_in_batch
+            and self.global_num_tokens is not None
+            and sum(self.global_num_tokens) > 0
+        )
 
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -1509,11 +1521,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             enable_custom_logit_processor=self.enable_custom_logit_processor,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            global_is_extend_in_batch=self.global_is_extend_in_batch,
         )
 
     def __str__(self):
         return (
-            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
 
@@ -1577,6 +1593,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    spec_num_draft_tokens: Optional[int] = None
 
 
 @triton.jit

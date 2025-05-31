@@ -627,15 +627,35 @@ class TokenizerManager:
 
     async def start_profile(
         self,
-        output_dir: Optional[str] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
+        output_dir: Optional[str],
+        num_steps: Optional[int],
+        activities: Optional[List[str]],
+        with_stack: Optional[bool],
+        record_shapes: Optional[bool],
+        profile_memory: Optional[bool] = None,
+        profile_funcs: Optional[List[str]] = None,
+        tp_ranks: Optional[List[int]] = None,
+        profile_steps: Optional[str] = None,
+        skip_first: Optional[int] = None,
+        wait:Optional[int] = None,
+        active: Optional[int] = None, 
+        repeat: Optional[int] = None 
     ):
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            profile_funcs=profile_funcs,
+            tp_ranks=tp_ranks,
+            profile_steps=profile_steps,
+            skip_first=skip_first,
+            wait=wait,
+            active=active, 
+            repeat=repeat             
         )
         result = (await self.start_profile_communicator(req))[0]
         if not result.success:

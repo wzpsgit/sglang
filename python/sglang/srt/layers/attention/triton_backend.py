@@ -138,7 +138,8 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        # self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits = 16
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
@@ -307,6 +308,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            self.max_kv_splits = 16 if max_extend_len > 256 else 2
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(

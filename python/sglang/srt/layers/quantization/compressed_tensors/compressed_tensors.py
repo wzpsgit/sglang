@@ -33,6 +33,11 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW4A16Sparse24,
+    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -304,6 +309,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_symmetric_activation = input_quant.symmetric
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
+
+    def _is_dynamic_token_int8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_int8_w8a8 = (weight_quant.type == QuantizationType.INT and input_quant.type == QuantizationType.INT)
+        return is_int8_w8a8 and self._is_dynamic_token_w8a8(weight_quant, input_quant)
 
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.

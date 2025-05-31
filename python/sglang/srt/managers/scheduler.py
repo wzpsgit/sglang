@@ -128,6 +128,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    function_profiler
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -471,7 +472,8 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    tp_cache_group=self.tp_worker.get_attention_tp_cpu_group(),
+                    #tp_cache_group=self.tp_worker.get_tp_cpu_group(),
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                 )
@@ -595,7 +597,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                #result = self.run_batch(batch)
+                result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                            self.run_batch, batch)                
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -617,7 +621,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                #result = self.run_batch(batch)
+                result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                            self.run_batch, batch)
                 self.result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
@@ -659,7 +665,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                #result = self.run_batch(batch)
+                result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                            self.run_batch, batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
             if len(self.disagg_prefill_infight_queue) > 0:
@@ -694,7 +702,9 @@ class Scheduler(
                         batch.reqs, [False for _ in range(len(batch.reqs))]
                     )
                 else:
-                    result = self.run_batch(batch)
+                    #result = self.run_batch(batch)
+                    result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                                self.run_batch, batch)                     
                     self.process_batch_result(batch, result)
 
             if batch is None and (
@@ -1147,6 +1157,30 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.metrics_collector.log_stats(self.stats)
 
+    def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+        """Coordinate the DP attention batch."""
+
+        local_info = torch.tensor(
+            [
+                (new_batch is not None),
+            ],
+            dtype=torch.int64,
+        )
+        global_info = torch.empty(
+            (self.server_args.dp_size, self.attn_tp_size, 1),
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            global_info.flatten(),
+            local_info,
+            group=self.tp_cpu_group,
+        )
+        any_new_batch = any(
+            global_info[:, 0, 0].tolist()
+        )  # Any DP worker has forward batch
+        return any_new_batch
+
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1174,7 +1208,12 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        if new_batch is not None:
+        any_new_batch = (
+            self.server_args.enable_dp_attention
+            and not self.spec_algorithm.is_none()
+            and self.coordinate_spec_dp_attn_batch(new_batch)
+        )
+        if new_batch is not None or any_new_batch:
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1381,7 +1420,7 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
-                model_worker_batch = batch.get_model_worker_batch()
+                model_worker_batch = batch.get_model_worker_batch()          
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
@@ -1462,8 +1501,6 @@ class Scheduler(
             global_num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not self.spec_algorithm.is_none() and self.spec_algorithm.is_eagle():
-                num_tokens = num_tokens * self.server_args.speculative_num_draft_tokens
             global_num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1519,6 +1556,8 @@ class Scheduler(
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+
+            local_batch.global_is_extend_in_batch = any(is_extend_in_batch)
 
             # Check forward mode for cuda graph
             if not self.server_args.disable_cuda_graph:
@@ -1812,6 +1851,14 @@ class Scheduler(
                 recv_req.activities,
                 recv_req.with_stack,
                 recv_req.record_shapes,
+                recv_req.profile_memory,
+                recv_req.profile_funcs,
+                recv_req.tp_ranks,
+                recv_req.profile_steps,
+                recv_req.skip_first,
+                recv_req.wait,
+                recv_req.active, 
+                recv_req.repeat 
             )
         else:
             return self.stop_profile()
@@ -1823,7 +1870,21 @@ class Scheduler(
         activities: Optional[List[str]],
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
+        profile_memory: Optional[bool] = None,
+        profile_funcs: Optional[List[str]] = None,
+        tp_ranks: Optional[List[int]] = None,        
+        profile_steps: Optional[str] = None,
+        skip_first: Optional[int] = None,
+        wait: Optional[int] = None,
+        active: Optional[int] = None, 
+        repeat: Optional[int] = None       
     ) -> None:
+        if(profile_funcs is not None):
+            function_profiler.start_profile(self.tp_rank, profile_funcs, output_dir,num_steps, 
+                activities, with_stack, record_shapes,  profile_memory, 
+                tp_ranks, profile_steps, skip_first, wait, active, repeat)
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         if self.profiler_activities:
             return ProfileReqOutput(
                 success=False,
@@ -1872,6 +1933,10 @@ class Scheduler(
             return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(self) -> None:
+        if(function_profiler.profile_funcs is not None):
+            function_profiler.stop_profile(self.tp_rank)
+            return
+            
         if self.profiler_activities is None:
             return
 

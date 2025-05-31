@@ -29,9 +29,11 @@ from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_device,
     get_hpu_memory_capacity,
+    get_mxgpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_cuda,
     is_flashinfer_available,
+    is_maca,
     is_hip,
     is_port_available,
     is_remote_url,
@@ -180,6 +182,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     enable_flashinfer_mla: bool = False  # TODO: remove this argument
+    enable_flashinfer_grouped_gemm: bool = False
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
@@ -217,7 +220,10 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
 
         if is_cuda():
-            gpu_mem = get_nvgpu_memory_capacity()
+            if is_maca():
+                gpu_mem = get_mxgpu_memory_capacity()
+            else:
+                gpu_mem = get_nvgpu_memory_capacity()
         elif is_hip():
             gpu_mem = get_amdgpu_memory_capacity()
         elif self.device == "hpu":
@@ -231,13 +237,14 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
-            if self.tp_size >= 16:
+            attention_tp_size = self.tp_size // self.dp_size
+            if attention_tp_size >= 16:
                 self.mem_fraction_static = 0.79
-            elif self.tp_size >= 8:
+            elif attention_tp_size >= 8:
                 self.mem_fraction_static = 0.81
-            elif self.tp_size >= 4:
+            elif attention_tp_size >= 4:
                 self.mem_fraction_static = 0.85
-            elif self.tp_size >= 2:
+            elif attention_tp_size >= 2:
                 self.mem_fraction_static = 0.87
             else:
                 self.mem_fraction_static = 0.88
@@ -840,6 +847,13 @@ class ServerArgs:
             action="store_true",
             help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
         )
+
+        parser.add_argument(
+            "--enable-flashinfer-grouped-gemm",
+            action="store_true",
+            help="Enable FlashInfer grouped gemm",
+        )
+
         parser.add_argument(
             "--enable-flashmla",
             action="store_true",

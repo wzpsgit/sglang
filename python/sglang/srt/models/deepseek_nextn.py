@@ -36,17 +36,21 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+
+from sglang.srt.layers.dp_attention import dp_gather_weight
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip, function_profiler
+from sglang.srt.layers.quantization.awq import awq_dequantize_wrapper
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize
+    from vllm._custom_ops import awq_dequantize as vllm_awq_dequantize
 else:
     from vllm import _custom_ops as ops
 
@@ -96,20 +100,25 @@ class DeepseekModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
 
-        hidden_states = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
-                ),
-                dim=-1,
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
             )
-        )
 
         residual = None
-        hidden_states, residual = self.decoder(
+        # hidden_states, residual = self.decoder(
+        #     positions, hidden_states, forward_batch, residual
+        # )
+        hidden_states, residual = function_profiler.run(1, 
+            f"NextN_{forward_batch.forward_mode.name}", self.decoder, 
             positions, hidden_states, forward_batch, residual
-        )
+        ) 
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
@@ -266,21 +275,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self_attn = self.model.decoder.self_attn
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda:
-                    w = awq_dequantize(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                    ).T
-                else:
-                    w = ops.awq_dequantize(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
-                    ).T
+                w = awq_dequantize_wrapper(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
             else:
                 w = self_attn.kv_b_proj.weight
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
@@ -335,6 +334,23 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                 if _is_hip:
                     self_attn.w_scale *= 2.0
+
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        if global_server_args_dict["enable_dp_attention"]:
+            global_head_data, local_head_data = (
+                torch.empty_like(self.lm_head.weight.data),
+                head.data,
+            )
+            dp_gather_weight(global_head_data, local_head_data)
+            self.lm_head.weight.data = global_head_data
+        else:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

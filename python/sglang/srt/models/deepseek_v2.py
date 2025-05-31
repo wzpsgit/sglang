@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -73,12 +74,23 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
+from sglang.srt.layers.quantization.awq import awq_dequantize_wrapper
+
+from vllm._custom_ops import cutlass_scaled_batch_mm as vllm_scaled_bmm_int8
+from vllm._custom_ops import scaled_int8_quant as vllm_scaled_int8_quant
+from vllm._custom_ops import awq_dequantize as vllm_awq_dequantize
+
+from sglang.srt.utils import function_profiler
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8
+    from sgl_kernel import awq_dequantize
+    try:
+        from sgl_kernel import bmm_fp8
+    except:
+        bmm_fp8 = None
 else:
     from vllm import _custom_ops as ops
 
@@ -219,7 +231,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            if hasattr(config,"moe_shared_intermediate_size"):
+                intermediate_size = config.moe_shared_intermediate_size * config.n_shared_experts
+            else:
+                intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+
             # disable tp for shared experts when enable deepep moe
             if not global_server_args_dict["enable_deepep_moe"]:
                 self.shared_experts = DeepseekV2MLP(
@@ -685,6 +701,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
+        self.w_kc_scale = None
+        self.w_vc_scale = None
 
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
@@ -852,6 +870,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_scale,
                 torch.bfloat16,
             )
+        elif self.w_vc.dtype == torch.int8:
+            # TODO: Check accuracy
+            attn_output_quant_val, attn_output_quant_scale, _ = vllm_scaled_int8_quant(attn_output)
+            attn_bmm_output = vllm_scaled_bmm_int8(a = attn_output_quant_val.transpose(0, 1), b = self.w_vc, scale_a = attn_output_quant_scale, scale_b = self.w_vc_scale, out_dtype = attn_output.dtype)
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
@@ -1028,6 +1050,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.dp_size = get_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -1124,6 +1147,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        tp_rank = get_tensor_model_parallel_rank()
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -1139,11 +1163,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
 
             # Self Attention
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            # hidden_states = self.self_attn(
+            #     positions=positions,
+            #     hidden_states=hidden_states,
+            #     forward_batch=forward_batch,
+            # )
+            hidden_states = function_profiler.run(tp_rank, f"L{self.layer_id}_MLA_{forward_batch.forward_mode.name}",
+                                                self.self_attn, positions, hidden_states, forward_batch)              
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
@@ -1155,21 +1181,25 @@ class DeepseekV2DecoderLayer(nn.Module):
                     forward_batch.gathered_buffer,
                     hidden_states,
                 )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch, is_nextn_dp=self.is_nextn)
+                dp_scatter(residual, hidden_states, forward_batch, is_nextn_dp=self.is_nextn)
                 hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if hidden_states.shape[0] > 0:
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+        else:
+            if hidden_states.shape[0] > 0:
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        #hidden_states = self.mlp(hidden_states)
+        hidden_states = function_profiler.run(tp_rank, f"L{self.layer_id}_MLP_{forward_batch.forward_mode.name}", 
+                                            self.mlp, hidden_states) 
 
         # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
@@ -1303,12 +1333,16 @@ class DeepseekV2Model(nn.Module):
             hidden_states = input_embeds
 
         residual = None
+        tp_rank = get_tensor_model_parallel_rank()
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            # hidden_states, residual = layer(
+            #     positions, hidden_states, forward_batch, residual
+            # )
+            hidden_states, residual = function_profiler.run(tp_rank,f"L{i}_{forward_batch.forward_mode.name}", layer, 
                 positions, hidden_states, forward_batch, residual
-            )
+            )            
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1388,20 +1422,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn = self.model.layers[layer_id].self_attn
                 if hasattr(self_attn.kv_b_proj, "qweight"):
                     # AWQ compatible
-                    if _is_cuda:
-                        w = awq_dequantize(
+                    w = awq_dequantize_wrapper(
                             self_attn.kv_b_proj.qweight,
                             self_attn.kv_b_proj.scales,
                             self_attn.kv_b_proj.qzeros,
-                        ).T
-                    else:
-                        w = ops.awq_dequantize(
-                            self_attn.kv_b_proj.qweight,
-                            self_attn.kv_b_proj.scales,
-                            self_attn.kv_b_proj.qzeros,
-                            0,
-                            0,
-                            0,
                         ).T
                 else:
                     w = self_attn.kv_b_proj.weight
@@ -1444,11 +1468,24 @@ class DeepseekV2ForCausalLM(nn.Module):
                         w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
                             torch.bfloat16
                         )
+                        # Note: Accuracy loss, disable now
+                        # w_kc_scale, w_vc_scale = self_attn.kv_b_proj.weight_scale.unflatten(
+                        #     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        # ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                        # self_attn.w_kc_scale = w_kc_scale.transpose(1, 2).contiguous().transpose(1, 2)
+                        # self_attn.w_vc_scale = w_vc_scale.contiguous().transpose(1, 2)
+
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+
+                # Note: Accuracy loss, disable now
+                # Do dequantization for w_kc
+                # if self_attn.w_kc.dtype == torch.int8 and self_attn.w_kc_scale is not None:
+                #     self_attn.w_kc = (self_attn.w_kc.to(torch.float32) * self_attn.w_kc_scale).to(torch.bfloat16)
+
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None

@@ -9,10 +9,10 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
+# if _is_cuda:
+    # from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+# else:
+from vllm import _custom_ops as vllm_ops
 
 
 def is_fp8_fnuz() -> bool:
@@ -116,12 +116,12 @@ def requantize_with_max_scale(
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
             weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
-            if _is_cuda:
-                weight[start:end, :], _ = sgl_scaled_fp8_quant(weight_dq, max_w_scale)
-            else:
-                weight[start:end, :], _ = vllm_ops.scaled_fp8_quant(
-                    weight_dq, max_w_scale
-                )
+            # if _is_cuda:
+            #     weight[start:end, :], _ = sgl_scaled_fp8_quant(weight_dq, max_w_scale)
+            # else:
+            weight[start:end, :], _ = vllm_ops.scaled_fp8_quant(
+                weight_dq, max_w_scale
+            )
             start = end
 
     return max_w_scale, weight

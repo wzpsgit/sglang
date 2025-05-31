@@ -76,10 +76,10 @@ if _is_hip:
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
+# if _is_cuda:
+#     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+# else:
+from vllm import _custom_ops as vllm_ops
 
 logger = logging.getLogger(__name__)
 
@@ -705,20 +705,20 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             for expert in range(layer.num_experts):
-                if _is_cuda:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                # if _is_cuda:
+                #     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                #         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                #     )
+                #     w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                #         sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                #     )
+                # else:
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                    vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                    vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -795,18 +795,18 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    if _is_cuda:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    else:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = vllm_ops.scaled_fp8_quant(
-                            dq_weight, max_w13_scales[expert_id]
-                        )
+                    # if _is_cuda:
+                    #     (
+                    #         layer.w13_weight[expert_id][start : start + shard_size, :],
+                    #         _,
+                    #     ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                    # else:
+                    (
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        _,
+                    ) = vllm_ops.scaled_fp8_quant(
+                        dq_weight, max_w13_scales[expert_id]
+                    )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(

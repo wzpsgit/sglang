@@ -34,9 +34,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_hip
+from sglang.srt.utils import get_available_gpu_memory, is_hip, get_bool_env_var
 
 _is_hip = is_hip()
+CUDA_GRAPH_DP_SUM_BS = get_bool_env_var("CUDA_GRAPH_DP_USE_SUM_BS")
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -292,12 +293,23 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
+            if not CUDA_GRAPH_DP_SUM_BS:
+                total_batch_size = (
+                    sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    else max(forward_batch.global_num_tokens_cpu)
+                )
+            else:
+                total_batch_size = (
+                    sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    else sum(forward_batch.global_num_tokens_cpu)
+                )
 
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                total_global_tokens in self.graphs
+                total_batch_size in self.graphs
                 if self.disable_padding
-                else total_global_tokens <= self.max_bs
+                else total_batch_size <= self.max_bs
             )
         else:
             is_bs_supported = (
@@ -373,18 +385,31 @@ class CudaGraphRunner:
         mrope_positions = self.mrope_positions[:, :bs]
 
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [
-                        num_tokens // self.dp_size + (i < bs % self.dp_size)
-                        for i in range(self.dp_size)
-                    ],
-                    dtype=torch.int32,
-                    device=input_ids.device,
+            if not CUDA_GRAPH_DP_SUM_BS:
+                self.global_num_tokens_gpu.copy_(
+                    torch.tensor(
+                        [
+                            num_tokens for i in range(self.dp_size)
+                        ],
+                        dtype=torch.int32,
+                        device=input_ids.device,
+                    )
                 )
-            )
-            global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[:num_tokens]
+                global_num_tokens = self.global_num_tokens_gpu
+                gathered_buffer = self.gathered_buffer[:num_tokens * self.dp_size]
+            else:
+                self.global_num_tokens_gpu.copy_(
+                    torch.tensor(
+                        [
+                            num_tokens // self.dp_size + (i < num_tokens % self.dp_size)
+                            for i in range(self.dp_size)
+                        ],
+                        dtype=torch.int32,
+                        device=input_ids.device,
+                    )
+                )
+                global_num_tokens = self.global_num_tokens_gpu
+                gathered_buffer = self.gathered_buffer[:num_tokens]
         else:
             global_num_tokens = None
             gathered_buffer = None
@@ -430,10 +455,24 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
+            from sglang.srt.model_executor.model_runner import (
+                mark_decode_kernel,
+                mark_prefill_kernel,
+            )
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
 
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
+            if forward_batch.forward_mode.is_decode():
+                if self.model_runner.enable_torch_profile:
+                    a = torch.zeros(1, dtype=torch.float32, device="cuda")
+                    mark_decode_kernel[(1,)](a, 128)
+            elif forward_batch.forward_mode.is_extend():
+                if self.model_runner.enable_torch_profile:
+                    a = torch.zeros(1, dtype=torch.float32, device="cuda")
+                    mark_prefill_kernel[(1,)](a, 128)
+
             return logits_output.next_token_logits, logits_output.hidden_states
 
         for _ in range(2):
@@ -475,9 +514,20 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            index = bisect.bisect_left(
-                self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
-            )
+            if not CUDA_GRAPH_DP_SUM_BS:
+                total_batch_size = (
+                    sum(forward_batch.global_num_tokens_cpu) / self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    else max(forward_batch.global_num_tokens_cpu)
+                )
+                index = bisect.bisect_left(self.capture_bs, total_batch_size)
+            else:
+                total_batch_size = (
+                    sum(forward_batch.global_num_tokens_cpu) / self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    else sum(forward_batch.global_num_tokens_cpu)
+                )
+                index = bisect.bisect_left(self.capture_bs, total_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]

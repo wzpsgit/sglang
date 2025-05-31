@@ -36,7 +36,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+    # from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
 
@@ -761,10 +761,10 @@ def invoke_fused_moe_kernel(
         per_token_quant_int8,
     )
 
-    if _is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+    # if _is_cuda:
+    #     from sglang.srt.layers.quantization.fp8_kernel import (
+    #         sglang_per_token_group_quant_fp8,
+    #     )
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -775,21 +775,21 @@ def invoke_fused_moe_kernel(
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
-            if _is_cuda:
-                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
-            else:
-                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
-        else:
-            # activation block-wise fp8 quantization
-            assert len(block_shape) == 2
-            block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
-            else:
-                A, A_scale = per_token_group_quant_fp8(A, block_k)
-            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
-            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+            # if _is_cuda:
+            #     A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            # else:
+            A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
+        # else:
+        #     # activation block-wise fp8 quantization
+        #     assert len(block_shape) == 2
+        #     block_n, block_k = block_shape[0], block_shape[1]
+        #     if _is_cuda:
+        #         A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+        #     else:
+        #         A, A_scale = per_token_group_quant_fp8(A, block_k)
+        #     assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+        #     assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+        #     assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a8:
         assert B_scale is not None
         if block_shape is None:
@@ -911,6 +911,7 @@ def get_config_file_name(
     E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
+    device_name = "Device_4000"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
@@ -1078,7 +1079,7 @@ def inplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    activation: str = "silu",
+    # activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -1099,7 +1100,7 @@ def inplace_fused_experts(
         topk_weights,
         topk_ids,
         True,
-        activation,
+        "silu",
         apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
@@ -1152,7 +1153,7 @@ def outplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    activation: str = "silu",
+    # activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -1174,7 +1175,7 @@ def outplace_fused_experts(
         topk_weights,
         topk_ids,
         False,
-        activation,
+        "silu",
         apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
@@ -1253,7 +1254,7 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
-            activation,
+            # activation,
             apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
@@ -1275,7 +1276,7 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
-            activation,
+            # activation,
             apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
@@ -1417,8 +1418,9 @@ def fused_experts_impl(
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
+        stage1_config = config["stage1"] if "stage1" in config else config
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            curr_topk_ids, config["BLOCK_SIZE_M"], E
+            curr_topk_ids, stage1_config["BLOCK_SIZE_M"], E
         )
 
         invoke_fused_moe_kernel(
@@ -1435,7 +1437,7 @@ def fused_experts_impl(
             num_tokens_post_padded,
             apply_router_weight_on_input,
             topk_ids.shape[1],
-            config,
+            stage1_config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
@@ -1445,7 +1447,10 @@ def fused_experts_impl(
         )
         if activation == "silu":
             if _is_cuda:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                if intermediate_cache2.dtype == torch.float16:
+                    torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                else:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -1459,6 +1464,8 @@ def fused_experts_impl(
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
+
+        stage2_config = config["stage2"] if "stage2" in config else config
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
@@ -1478,7 +1485,7 @@ def fused_experts_impl(
             num_tokens_post_padded,
             not apply_router_weight_on_input,
             1,
-            config,
+            stage2_config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,

@@ -21,6 +21,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import logging
+import os
 
 import triton
 import triton.language as tl
@@ -405,7 +406,6 @@ def _fwd_grouped_kernel_stage1(
             mask=mask_h,
         )
 
-
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -419,7 +419,8 @@ def _decode_grouped_att_m_fwd(
     sm_scale,
     logit_cap,
 ):
-    BLOCK = 32
+    # BLOCK = 32
+    BLOCK = 16
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
@@ -442,21 +443,21 @@ def _decode_grouped_att_m_fwd(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
-    MAX_KV_SPLITS = max_kv_splits
+    MAX_KV_SPLITS = 16
+    num_stages = 1
+    extra_kargs={"scenario" : "mla"}
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
         MAX_KV_SPLITS,
     )
 
-    extra_kargs = {}
-    num_stages = 2
     if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
-
+    os.environ["TRITON_DISABLE_MACA_C_STRORE_PAD"] = "1"
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -491,6 +492,7 @@ def _decode_grouped_att_m_fwd(
         Lv=Lv,
         **extra_kargs,
     )
+    os.unsetenv("TRITON_DISABLE_MACA_C_STRORE_PAD")
 
 
 @triton.jit

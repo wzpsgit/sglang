@@ -28,6 +28,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
+    m_grouped_gemm_nt_masked,
+    silu_and_mul_masked_fwd,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
@@ -39,13 +41,17 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8EPMoEMethod
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Int8EPMoEMethod
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
+# if _is_cuda:
+#     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+# else:
+from vllm import _custom_ops as vllm_ops
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +86,9 @@ class GroupedGemmRunner(torch.nn.Module):
         b: torch.Tensor,
         c: torch.Tensor,
         batch_size: int,
+        top_k: int,
         weight_column_major: bool,
+        gateup_stage: bool,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
         use_fp8_w8a8: bool = False,
@@ -107,7 +115,9 @@ class GroupedGemmRunner(torch.nn.Module):
                 b,
                 c,
                 batch_size,
+                top_k,
                 weight_column_major,
+                gateup_stage,
                 seg_indptr,
                 weight_indices,
                 use_fp8_w8a8,
@@ -170,6 +180,8 @@ class EPMoE(torch.nn.Module):
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
         self.activation = activation
+        self.use_int8_w8a8 = False
+        self.use_presharded_weights = False
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -177,7 +189,7 @@ class EPMoE(torch.nn.Module):
             self.use_block_quant = False
             self.block_shape = None
             self.activation_scheme = None
-        else:
+        elif quant_config.get_name() == "fp8":
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                 quant_config
             )
@@ -190,6 +202,19 @@ class EPMoE(torch.nn.Module):
             )
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
+        else:
+            if quant_config.get_name() == "compressed_tensors":
+                self.quant_method: Optional[QuantizeMethodBase] = CompressedTensorsW8A8Int8EPMoEMethod(quant_config)
+            if quant_config.get_name() == "w8a8_int8":
+                self.quant_method: Optional[QuantizeMethodBase] = W8A8Int8EPMoEMethod(quant_config)
+
+            self.use_fp8_w8a8 = False
+            self.use_int8_w8a8 = True
+            self.use_block_quant = False
+            self.block_shape = None
+            self.use_presharded_weights = True
+            self.activation_scheme = "static"
+        assert self.quant_method is not None, "For W8A8Int8EPMoE, we only support CompressedTensorsW8A8 and W8A8Int8 currently, check your quant method"
 
         self.quant_method.create_weights(
             layer=self,
@@ -201,6 +226,7 @@ class EPMoE(torch.nn.Module):
         )
 
         self.grouped_gemm_runner = None
+        self.use_flashinfer = True if global_server_args_dict["enable_flashinfer_grouped_gemm"] else False
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
@@ -208,7 +234,7 @@ class EPMoE(torch.nn.Module):
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
-                use_flashinfer=False,  # TODO: use flashinfer
+                use_flashinfer=self.use_flashinfer,  # TODO: use flashinfer
             )
 
         topk_weights, topk_ids = select_experts(
@@ -277,7 +303,9 @@ class EPMoE(torch.nn.Module):
             b=self.w13_weight,
             c=gateup_output,
             batch_size=self.num_experts_per_partition,
+            top_k = self.top_k,
             weight_column_major=True,
+            gateup_stage = True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
@@ -345,7 +373,9 @@ class EPMoE(torch.nn.Module):
             b=self.w2_weight,
             c=down_output,
             batch_size=self.num_experts_per_partition,
+            top_k = self.top_k,
             weight_column_major=True,
+            gateup_stage = False,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
@@ -421,6 +451,10 @@ class EPMoE(torch.nn.Module):
 
         # Special case for fp8 scales.
         if "scale" in weight_name:
+            if self.use_int8_w8a8:
+                self._load_int8_weight_scale(param.data, loaded_weight, weight_name, shard_id, expert_id)
+                return
+
             self._load_fp8_scale(
                 param.data,
                 loaded_weight,
@@ -487,6 +521,287 @@ class EPMoE(torch.nn.Module):
                 else:
                     param_data[expert_id] = loaded_weight
 
+    # Similar to fused moe weight loader implementation
+    def _load_int8_weight_scale(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        # TODO: check self.quant_method.quant_config.quant_format
+        # against known CompressionFormat enum values that have this quality
+        loaded_weight = (
+            loaded_weight.t().contiguous()
+            if (
+                self.quant_method.__class__.__name__
+                == "CompressedTensorsWNA16MoEMethod"
+            )
+            else loaded_weight
+        )
+
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+            )
+
+        WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
+        # Fetch the dim to shard the parameter/loaded weight
+        # based on the shard id. This will be whatever
+        # dimension intermediate_size is used.
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        expert_data = param.data[expert_id]
+        tp_rank = self.tp_rank
+
+        # is_transposed: if the dim to shard the weight
+        # should be flipped. Required by GPTQ, compressed-tensors
+        # should be whatever dimension intermediate_size is
+        is_transposed = getattr(param, "is_transposed", False)
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if is_transposed:
+            shard_dim = ~shard_dim
+
+        # Case input scale: input_scale loading is only supported for fp8
+        if "input_scale" in weight_name:
+            # this is needed for compressed-tensors only
+            loaded_weight = loaded_weight.to(param.data.device)
+
+            if (
+                param.data[expert_id] != 1
+                and (param.data[expert_id] - loaded_weight).abs() > 1e-5
+            ):
+                raise ValueError(
+                    "input_scales of w1 and w3 of a layer "
+                    f"must be equal. But got {param.data[expert_id]} "
+                    f"vs. {loaded_weight}"
+                )
+
+            self._load_single_value(
+                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+            )
+            return
+
+        # Case g_idx
+        if "g_idx" in weight_name:
+            self._load_g_idx(
+                shard_dim=0,
+                shard_id=shard_id,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+            return
+
+        # Case weight scales and zero_points
+        if "scale" in weight_name or "zero" in weight_name:
+            # load the weight scales and zp based on the quantization scheme
+            # supported weight scales/zp can be found in
+            # FusedMoeWeightScaleSupported
+            quant_method = getattr(param, "quant_method", None)
+
+            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
+            elif quant_method in [
+                FusedMoeWeightScaleSupported.GROUP.value,
+                FusedMoeWeightScaleSupported.BLOCK.value,
+            ]:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
+            elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=expert_id,
+                )
+            else:
+                # Channel-wise by default
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
+            return
+
+        # Case weight_shape
+        if "weight_shape" in weight_name:
+            # only required by compressed-tensors
+            self._load_single_value(
+                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+            )
+            return
+
+        # Case model weights
+        if "weight" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+            return
+
+# TODO: Implement weight loader of int8
+    def _load_per_tensor_weight_scale(
+        self,
+        shard_id: str,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+    ):
+        param_data = param.data
+        # for per tensor weight quantization
+        if shard_id in ("w1", "w3"):
+            # We have to keep the weight scales of w1 and w3 because
+            # we need to re-quantize w1/w3 weights after weight loading.
+            idx = 0 if shard_id == "w1" else 1
+            param_data[expert_id][idx] = loaded_weight
+        # If we are in the row parallel case (down_proj)
+        elif shard_id == "w2":
+            param_data[expert_id] = loaded_weight
+
+    def _load_model_weight_or_group_weight_scale(
+        self,
+        shard_dim: int,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        loaded_weight: torch.tensor,
+        tp_rank: int,
+    ):
+        # Load grouped weight scales for group quantization
+        # or model weights
+        if shard_id == "w2":
+            self._load_w2(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+        elif shard_id in ("w1", "w3"):
+            self._load_w13(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+
+    def _load_per_channel_weight_scale(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.tensor,
+        tp_rank: int,
+    ):
+        # for per channel weight quantization
+        if shard_id == "w2":
+            expert_data.copy_(loaded_weight)
+        elif shard_id in ("w1", "w3"):
+            self._load_w13(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+
+    def _load_w13(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.tensor,
+        tp_rank: int,
+    ):
+        # Index the loaded weight for tp sharding.
+        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+        shard_size = expert_data.shape[shard_dim] // 2
+
+        if not self.use_presharded_weights:
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
+            )
+
+        # Narrow parameter and load.
+        # w1, gate_proj: Load into first logical weight of w13.
+        if shard_id == "w1":
+            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+        # w3, up_proj: Load into second logical weight of w13.
+        else:
+            assert shard_id == "w3"
+            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+        expert_data.copy_(loaded_weight)
+
+    def _load_w2(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.tensor,
+        tp_rank: int,
+    ):
+
+        # Index the loaded weight for tp sharding.
+        # down_proj: "RowParallel" so tp sharding on input_dim
+        # Narrow parameter and load.
+        shard_size = expert_data.shape[shard_dim]
+
+        if not self.use_presharded_weights:
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
+            )
+
+        # w2, down_proj: Load into only logical weight of w2.
+        expert_data.copy_(loaded_weight)
+
+    def _load_single_value(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
+    ):
+        param_data = param.data
+
+        # Input scales can be loaded directly and should be equal.
+        param_data[expert_id] = loaded_weight
+
+    def _load_g_idx(
+        self,
+        shard_id: str,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        loaded_weight: torch.tensor,
+        tp_rank: int,
+    ):
+
+        if shard_id == "w2":
+            self._load_w2(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+        else:
+            assert shard_id in ("w1", "w3")
+            expert_data.copy_(loaded_weight)
+
+# TODO: End implementation
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
 
@@ -740,20 +1055,20 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
 
             for expert in range(layer.num_experts_per_partition):
-                if _is_cuda:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                # if _is_cuda:
+                #     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                #         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                #     )
+                #     w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                #         sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                #     )
+                # else:
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                    vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                    vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
             return
@@ -833,8 +1148,8 @@ class DeepEPMoE(EPMoE):
             activation,
         )
         self.deepep_mode = deepep_mode
-        if self.deepep_mode.enable_low_latency():
-            assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+        # if self.deepep_mode.enable_low_latency():
+        #     assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -861,7 +1176,8 @@ class DeepEPMoE(EPMoE):
         if resolved_deepep_mode == DeepEPMode.normal:
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+            # return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+            return self.forward_deepgemm_masked_v1(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
@@ -1043,3 +1359,59 @@ class DeepEPMoE(EPMoE):
         )
 
         return down_output
+
+    def forward_deepgemm_masked_v1(
+        self,
+        hidden_states: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+    ):
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+
+        # GroupGemm-0
+        num_groups, m, k = hidden_states.size()
+        n = self.w13_weight.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
+        )
+
+        m_grouped_gemm_nt_masked(
+            hidden_states, 
+            self.w13_weight, 
+            gateup_output, 
+            masked_m, 
+            expected_m,
+            self.w13_weight_scale,
+            True
+        )
+        # Act
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=gateup_output.device,
+            dtype=gateup_output.dtype,
+        )
+       
+        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+
+        # GroupGemm-1
+        n = self.w2_weight.size(1)
+        down_output = torch.empty(
+            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
+        )
+        m_grouped_gemm_nt_masked(
+            down_input, 
+            self.w2_weight, 
+            down_output, 
+            masked_m, 
+            expected_m,
+            self.w2_weight_scale,
+            use_triton_kernel = True
+        )
+        return down_output
+
+

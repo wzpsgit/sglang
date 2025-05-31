@@ -49,7 +49,11 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        # Note: sglang 0.4.5 do not support float16 currently
+        if x.dtype == torch.float16:
+            torch.ops._C.silu_and_mul(out, x)
+        else:
+            silu_and_mul(x, out)
         return out
 
 

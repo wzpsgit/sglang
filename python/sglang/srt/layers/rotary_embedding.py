@@ -149,14 +149,23 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda_available and (self.head_size in [64, 128, 256, 512]):
-            apply_rope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
-                cos_sin_cache=self.cos_sin_cache,
-                is_neox=self.is_neox_style,
-            )
+            if (self.cos_sin_cache.device != query.device) or (self.cos_sin_cache.dtype != query.dtype):
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+
+            # Note: sglang 0.4.5 do not support float16 currently
+            if (query.dtype == torch.float16) and (key.dtype == torch.float16):
+                from vllm import _custom_ops as vllm_ops
+                vllm_ops.rotary_embedding(positions=positions, query=query, key=key, head_size=self.head_size,
+                                          cos_sin_cache=self.cos_sin_cache, is_neox=self.is_neox_style)
+            else:
+                apply_rope_with_cos_sin_cache_inplace(
+                    positions=positions,
+                    query=query,
+                    key=key,
+                    head_size=self.head_size,
+                    cos_sin_cache=self.cos_sin_cache,
+                    is_neox=self.is_neox_style,
+                )
         else:
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             ops.rotary_embedding(

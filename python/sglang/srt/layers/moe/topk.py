@@ -217,7 +217,7 @@ def biased_grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    compiled: bool = True,
+    compiled: bool = False,
     n_share_experts_fusion: int = 0,
 ):
     biased_grouped_topk_fn = (

@@ -44,8 +44,8 @@ class CustomOp(nn.Module):
             return self.forward_native
 
 
-if _is_cuda:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+# if _is_cuda:
+#     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
     def scaled_fp8_quant(
         input: torch.Tensor,
@@ -82,25 +82,25 @@ if _is_cuda:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=out_dtype)
 
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                sgl_per_token_quant_fp8(input, output, scale)
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                sgl_per_tensor_quant_fp8(
-                    input, output, scale, is_static=False
-                )  # False for dynamic
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=True
-            )  # True for static
+        # if scale is None:
+        #     # Dynamic scaling
+        #     if use_per_token_if_dynamic:
+        #         scale = torch.empty(
+        #             (shape[0], 1), device=input.device, dtype=torch.float32
+        #         )
+        #         sgl_per_token_quant_fp8(input, output, scale)
+        #     else:
+        #         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+        #         sgl_per_tensor_quant_fp8(
+        #             input, output, scale, is_static=False
+        #         )  # False for dynamic
+        # else:
+        #     # Static scaling
+        #     assert (
+        #         scale.numel() == 1
+        #     ), f"Expected scalar scale, got numel={scale.numel()}"
+        #     sgl_per_tensor_quant_fp8(
+        #         input, output, scale, is_static=True
+        #     )  # True for static
 
         return output, scale

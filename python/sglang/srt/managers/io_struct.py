@@ -652,6 +652,18 @@ class ProfileReqInput:
     num_steps: Optional[int] = None
     activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
 
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
+    profile_memory: Optional[bool] = None
+
+    profile_funcs: Optional[List[str]] = None
+    tp_ranks: Optional[List[int]] = None 
+    profile_steps: Optional[List[int]] = None
+    skip_first: Optional[int] = None
+    wait:Optional[int] = None
+    active: Optional[int] = None , 
+    repeat: Optional[int] = None
+
 
 class ProfileReqType(Enum):
     START_PROFILE = 1
@@ -675,9 +687,18 @@ class ProfileReq:
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
+
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_memory: Optional[bool] = None
 
+    profile_funcs: Optional[List[str]] = None
+    tp_ranks: Optional[List[int]] = None 
+    profile_steps: Optional[str] = None
+    skip_first: Optional[int] = None
+    wait:Optional[int] = None
+    active: Optional[int] = None 
+    repeat: Optional[int] = None
 
 @dataclass
 class ProfileReqOutput:

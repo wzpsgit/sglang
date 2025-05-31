@@ -40,8 +40,8 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
-    from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
+    # import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
+    # from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
     sm_version = get_device_sm()
     if sm_version >= 90 and get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
@@ -266,53 +266,53 @@ def per_token_group_quant_fp8(
     return x_q, x_s
 
 
-def sglang_per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,
-):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
+# def sglang_per_token_group_quant_fp8(
+#     x: torch.Tensor,
+#     group_size: int,
+#     eps: float = 1e-10,
+#     dtype: torch.dtype = fp8_type_,
+# ):
+#     assert (
+#         x.shape[-1] % group_size == 0
+#     ), "the last dimension of `x` cannot be divisible by `group_size`"
+#     assert x.is_contiguous(), "`x` is not contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
+#     finfo = torch.finfo(dtype)
+#     fp8_max = finfo.max
 
-    fp8_min = -fp8_max
+#     fp8_min = -fp8_max
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    M = x.numel() // group_size
-    N = group_size
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
+#     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+#     M = x.numel() // group_size
+#     N = group_size
+#     x_s = torch.empty(
+#         x.shape[:-1] + (x.shape[-1] // group_size,),
+#         device=x.device,
+#         dtype=torch.float32,
+#     )
 
-    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+#     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
-    return x_q, x_s
+#     return x_q, x_s
 
 
-def sglang_per_token_quant_fp8(
-    x: torch.Tensor,
-    dtype: torch.dtype = fp8_type_,
-):
-    assert x.is_contiguous(), "`x` is not contiguous"
+# def sglang_per_token_quant_fp8(
+#     x: torch.Tensor,
+#     dtype: torch.dtype = fp8_type_,
+# ):
+#     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = torch.empty(
-        x.shape[0],
-        1,
-        device=x.device,
-        dtype=torch.float32,
-    )
+#     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+#     x_s = torch.empty(
+#         x.shape[0],
+#         1,
+#         device=x.device,
+#         dtype=torch.float32,
+#     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+#     sgl_per_token_quant_fp8(x, x_q, x_s)
 
-    return x_q, x_s
+#     return x_q, x_s
 
 
 @triton.jit

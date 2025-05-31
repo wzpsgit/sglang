@@ -411,15 +411,15 @@ def _set_envs_and_config(server_args: ServerArgs):
         # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
         maybe_set_triton_cache_manager()
 
-    # Check flashinfer version
-    if server_args.attention_backend == "flashinfer":
-        assert_pkg_version(
-            "flashinfer_python",
-            "0.2.3",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
+    # # Check flashinfer version
+    # if server_args.attention_backend == "flashinfer":
+    #     assert_pkg_version(
+    #         "flashinfer_python",
+    #         "0.2.3",
+    #         "Please uninstall the old version and "
+    #         "reinstall the latest version by following the instructions "
+    #         "at https://docs.flashinfer.ai/installation.html.",
+    #     )
 
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
