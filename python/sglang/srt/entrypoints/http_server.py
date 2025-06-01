@@ -336,14 +336,8 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput()
-
-    await _global_state.tokenizer_manager.start_profile(
-        output_dir=obj.output_dir,
-        num_steps=obj.num_steps,
-        activities=obj.activities,
-        with_stack=obj.with_stack,
-        record_shapes=obj.record_shapes,
-    )
+    logger.info(f"Profiling request input:\n {obj}")
+    await _global_state.tokenizer_manager.start_profile(obj)
     return Response(
         content="Start profiling.\n",
         status_code=200,

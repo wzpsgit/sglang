@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.function_profiler import profiler as function_profiler
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -101,9 +102,13 @@ class DeepseekModelNextN(nn.Module):
         )
 
         residual = None
-        hidden_states, residual = self.decoder(
+        # hidden_states, residual = self.decoder(
+        #     positions, hidden_states, forward_batch, residual, zero_allocator
+        # )
+        hidden_states, residual = function_profiler.run(1, 
+            f"NextN_{forward_batch.forward_mode.name}", self.decoder, 
             positions, hidden_states, forward_batch, residual, zero_allocator
-        )
+        )         
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)

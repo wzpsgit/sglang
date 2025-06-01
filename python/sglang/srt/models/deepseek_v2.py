@@ -91,7 +91,7 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
-
+from sglang.srt.function_profiler import profiler as function_profiler
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
@@ -1443,9 +1443,14 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            # hidden_states, residual = layer(
+            #     positions, hidden_states, forward_batch, residual, zero_allocator
+            # )
+            tp_rank = get_tensor_model_parallel_rank()
+            hidden_states, residual = function_profiler.run(
+                tp_rank, f"L{i}_{forward_batch.forward_mode.name}", layer, 
                 positions, hidden_states, forward_batch, residual, zero_allocator
-            )
+            )            
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)

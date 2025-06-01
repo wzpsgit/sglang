@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
+    ProfileReqInput,
     ProfileReqOutput,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
@@ -759,20 +760,30 @@ class TokenizerManager:
 
     async def start_profile(
         self,
-        output_dir: Optional[str] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
-        with_stack: Optional[bool] = None,
-        record_shapes: Optional[bool] = None,
+        profile_config: Optional[ProfileReqInput] = None
     ):
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=output_dir,
-            num_steps=num_steps,
-            activities=activities,
-            with_stack=with_stack,
-            record_shapes=record_shapes,
-            profile_id=str(time.time()),
+        if(profile_config is not None):
+            req = ProfileReq(
+                type=ProfileReqType.START_PROFILE,
+                    output_dir=profile_config.output_dir,
+                    num_steps=profile_config.num_steps,
+                    activities=profile_config.activities,
+                    profile_id=profile_config.profile_id, 
+                    with_stack=profile_config.with_stack,
+                    record_shapes=profile_config.record_shapes,
+                    profile_memory=profile_config.profile_memory,
+                    profile_funcs=profile_config.profile_funcs,
+                    tp_ranks=profile_config.tp_ranks,
+                    profile_steps=profile_config.profile_steps,
+                    skip_first=profile_config.skip_first,
+                    wait=profile_config.wait,
+                    active=profile_config.active, 
+                    repeat=profile_config.repeat             
+                )
+        else:
+            req = ProfileReq(
+                type=ProfileReqType.START_PROFILE,
+                profile_id=str(time.time())
         )
         result = (await self.start_profile_communicator(req))[0]
         if not result.success:

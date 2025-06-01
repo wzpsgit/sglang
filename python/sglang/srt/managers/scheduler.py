@@ -140,6 +140,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.function_profiler import profiler as function_profiler
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 expert_distribution_recorder = ExpertDistributionRecorder()
@@ -637,7 +638,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                #result = self.run_batch(batch)
+                result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                            self.run_batch, batch)                
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -660,7 +663,9 @@ class Scheduler(
 
             if batch:
                 batch.launch_done = threading.Event()
-                result = self.run_batch(batch)
+                #result = self.run_batch(batch)
+                result = function_profiler.run(self.tp_rank, f"run_batch_{batch.forward_mode.name}", 
+                                            self.run_batch, batch)
                 self.result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
@@ -714,7 +719,9 @@ class Scheduler(
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
+                    #result = self.run_batch(self.cur_batch)
+                    result = function_profiler.run(self.tp_rank, f"run_batch_pp_{self.cur_batch.forward_mode.name}", 
+                                                self.run_batch, self.cur_batch)                    
 
                 # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
@@ -2057,27 +2064,27 @@ class Scheduler(
 
     def start_profile(
         self,
-        output_dir: Optional[str],
-        num_steps: Optional[int],
-        activities: Optional[List[str]],
-        with_stack: Optional[bool],
-        record_shapes: Optional[bool],
-        profile_id: Optional[str],
+        req: ProfileReq       
     ) -> None:
+        if(req.profile_funcs is not None):
+            function_profiler.start_profile(self.tp_rank, req)
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         if self.profiler_activities:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
-
+        output_dir = req.output_dir
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        activities = req.activities
         if activities is None:
             activities = ["CPU", "GPU"]
 
         self.torch_profiler_output_dir = output_dir
         self.profiler_activities = activities
-        self.profiler_id = profile_id
+        self.profiler_id = req.profile_id
         logger.info(
             "Profiling starts. Traces will be saved to: %s (with id %s)",
             self.torch_profiler_output_dir,
@@ -2095,8 +2102,9 @@ class Scheduler(
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=with_stack if with_stack is not None else True,
-                record_shapes=record_shapes if record_shapes is not None else False,
+                with_stack=function_profiler.with_stack,
+                record_shapes=function_profiler.record_shapes,
+                profile_memory=function_profiler.profile_memory,
             )
             self.torch_profiler.start()
 
@@ -2106,14 +2114,18 @@ class Scheduler(
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
-        if num_steps:
-            self.profiler_target_forward_ct = self.forward_ct + num_steps
+        if req.num_steps:
+            self.profiler_target_forward_ct = self.forward_ct + req.num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
             return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(self) -> None:
+        if(function_profiler.profile_funcs is not None):
+            function_profiler.stop_profile(self.tp_rank)
+            return
+            
         if self.profiler_activities is None:
             return
 
