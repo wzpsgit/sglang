@@ -80,7 +80,7 @@ from vllm._custom_ops import cutlass_scaled_batch_mm as vllm_scaled_bmm_int8
 from vllm._custom_ops import scaled_int8_quant as vllm_scaled_int8_quant
 from vllm._custom_ops import awq_dequantize as vllm_awq_dequantize
 
-from sglang.srt.utils import function_profiler
+from sglang.srt.function_profiler import profiler as function_profiler
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()

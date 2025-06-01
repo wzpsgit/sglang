@@ -80,8 +80,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
-    function_profiler
+    set_cuda_arch
 )
 
 import triton
@@ -144,6 +143,7 @@ class ModelRunner:
             and not server_args.disable_mla
         )
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.enable_torch_profile = os.getenv('MX_ENABLE_CUSTOM_PROFILE', 'False').lower() == 'true'
 
         # Model-specific adjustment
         self.model_specific_adjustment()

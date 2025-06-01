@@ -33,7 +33,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend, function_profiler
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.function_profiler import profiler as function_profiler
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)

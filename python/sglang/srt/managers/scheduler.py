@@ -127,9 +127,9 @@ from sglang.srt.utils import (
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers,
-    function_profiler
+    suppress_other_loggers
 )
+from sglang.srt.function_profiler import profiler as function_profiler
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 expert_distribution_recorder = ExpertDistributionRecorder()
@@ -1845,44 +1845,16 @@ class Scheduler(
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            return self.start_profile(
-                recv_req.output_dir,
-                recv_req.num_steps,
-                recv_req.activities,
-                recv_req.with_stack,
-                recv_req.record_shapes,
-                recv_req.profile_memory,
-                recv_req.profile_funcs,
-                recv_req.tp_ranks,
-                recv_req.profile_steps,
-                recv_req.skip_first,
-                recv_req.wait,
-                recv_req.active, 
-                recv_req.repeat 
-            )
+            return self.start_profile(recv_req)
         else:
             return self.stop_profile()
 
     def start_profile(
         self,
-        output_dir: Optional[str],
-        num_steps: Optional[int],
-        activities: Optional[List[str]],
-        with_stack: Optional[bool],
-        record_shapes: Optional[bool],
-        profile_memory: Optional[bool] = None,
-        profile_funcs: Optional[List[str]] = None,
-        tp_ranks: Optional[List[int]] = None,        
-        profile_steps: Optional[str] = None,
-        skip_first: Optional[int] = None,
-        wait: Optional[int] = None,
-        active: Optional[int] = None, 
-        repeat: Optional[int] = None       
+        req: ProfileReq       
     ) -> None:
-        if(profile_funcs is not None):
-            function_profiler.start_profile(self.tp_rank, profile_funcs, output_dir,num_steps, 
-                activities, with_stack, record_shapes,  profile_memory, 
-                tp_ranks, profile_steps, skip_first, wait, active, repeat)
+        if(req.profile_funcs is not None):
+            function_profiler.start_profile(self.tp_rank, req)
             return ProfileReqOutput(success=True, message="Succeeded")
 
         if self.profiler_activities:
@@ -1890,9 +1862,10 @@ class Scheduler(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
-
+        output_dir = req.output_dir
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        activities = req.activities
         if activities is None:
             activities = ["CPU", "GPU"]
 
@@ -1909,13 +1882,14 @@ class Scheduler(
         }
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
-        ]
+        ]                       
 
-        if torchprof_activities:
+        if len(torchprof_activities) > 0:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=with_stack if with_stack is not None else True,
-                record_shapes=record_shapes if record_shapes is not None else False,
+                with_stack=function_profiler.with_stack,
+                record_shapes=function_profiler.record_shapes,
+                profile_memory=function_profiler.profile_memory,
             )
             self.torch_profiler.start()
 
@@ -1925,8 +1899,8 @@ class Scheduler(
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
-        if num_steps:
-            self.profiler_target_forward_ct = self.forward_ct + num_steps
+        if req.num_steps:
+            self.profiler_target_forward_ct = self.forward_ct + req.num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
